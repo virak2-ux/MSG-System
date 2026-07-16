@@ -1,0 +1,339 @@
+<script>
+  // ---------- navigation ----------
+  document.querySelectorAll('nav button').forEach(btn => {
+    btn.addEventListener('click', () => showView(btn.dataset.view));
+  });
+  function showView(name) {
+    document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.view === name));
+    document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + name));
+    const loaders = {
+      dashboard: loadDashboard, approvals: loadApprovals, meetings: loadMeetings,
+      members: loadMembers, savings: loadSavings, loans: loadLoans,
+      repayments: loadRepayments, history: () => loadHistory('cash'), reports: loadReportsDefaults
+    };
+    if (loaders[name]) loaders[name]();
+  }
+
+  function flash(msg, ok) {
+    const el = document.getElementById('flash');
+    el.innerHTML = '<div class="msg ' + (ok ? 'ok' : 'err') + '">' + msg + '</div>';
+    setTimeout(() => { el.innerHTML = ''; }, 6000);
+  }
+
+  function run(fnName, ...args) {
+    return new Promise((resolve, reject) => {
+      google.script.run
+        .withSuccessHandler(resolve)
+        .withFailureHandler(err => reject(err))
+        [fnName](...args);
+    });
+  }
+
+  function formToObject(form, excludeNames) {
+    const data = {};
+    new FormData(form).forEach((v, k) => {
+      if (excludeNames && excludeNames.includes(k)) return;
+      if (v !== '') data[k] = v;
+    });
+    return data;
+  }
+
+  function renderTable(el, rows, columns, actionsFn) {
+    if (!rows || !rows.length) { el.innerHTML = '<tr><td class="empty">No records.</td></tr>'; return; }
+    let html = '<thead><tr>' + columns.map(c => '<th>' + c.label + '</th>').join('') +
+      (actionsFn ? '<th></th>' : '') + '</tr></thead><tbody>';
+    rows.forEach(r => {
+      html += '<tr>' + columns.map(c => '<td>' + formatCell(r[c.key], c.key) + '</td>').join('') +
+        (actionsFn ? '<td>' + actionsFn(r) + '</td>' : '') + '</tr>';
+    });
+    html += '</tbody>';
+    el.innerHTML = html;
+  }
+
+  function formatCell(v, key) {
+    if (v === undefined || v === null || v === '') return '';
+    if (key === 'Approval Status') return '<span class="pill ' + v.toLowerCase() + '">' + v + '</span>';
+    if (key === 'Posted?') return '<span class="pill ' + (v === 'Yes' ? 'yes' : 'no') + '">' + v + '</span>';
+    if (v instanceof Date) return v.toLocaleDateString();
+    if (typeof v === 'number') return v.toLocaleString(undefined, { maximumFractionDigits: 2 });
+    return String(v);
+  }
+
+  // ---------- DASHBOARD ----------
+  function loadDashboard() {
+    run('getDashboardSnapshot').then(d => {
+      const grid = document.getElementById('kpiGrid');
+      grid.innerHTML = d.indicators.map(i =>
+        '<div class="card kpi"><div class="label">' + i.label + '</div><div class="value">' +
+        (typeof i.value === 'number' ? i.value.toLocaleString(undefined, { maximumFractionDigits: 2 }) : i.value) +
+        '</div></div>').join('');
+      renderTable(document.getElementById('actionTable'), d.actions,
+        [{ key: 'check', label: 'Check' }, { key: 'rule', label: 'Rule' },
+         { key: 'current', label: 'Current' }, { key: 'target', label: 'Target' }, { key: 'action', label: 'Action' }]);
+    }).catch(e => flash('Dashboard load failed: ' + e.message, false));
+  }
+
+  // ---------- APPROVALS ----------
+  function loadApprovals() {
+    run('getPendingApprovals').then(p => {
+      renderTable(document.getElementById('tblPendSavings'), p.savings,
+        [{ key: 'Transaction ID', label: 'ID' }, { key: 'Meeting ID', label: 'Meeting' }, { key: 'Member Name', label: 'Member' },
+         { key: 'Savings Type', label: 'Type' }, { key: 'Signed Amount USD', label: 'Amount USD' }],
+        r => '<button class="btn small" onclick="approve(\'Saving\',\'' + r['Transaction ID'] + '\')">Approve</button>');
+
+      renderTable(document.getElementById('tblPendLoans'), p.loans,
+        [{ key: 'Loan ID', label: 'ID' }, { key: 'Member Name', label: 'Member' }, { key: 'Principal USD', label: 'Principal' },
+         { key: 'Interest Method', label: 'Method' }, { key: 'Annual Interest Rate', label: 'Rate' }],
+        r => '<button class="btn small" onclick="approve(\'Loan\',\'' + r['Loan ID'] + '\')">Approve</button>');
+
+      renderTable(document.getElementById('tblPendRepayments'), p.repayments,
+        [{ key: 'Transaction ID', label: 'ID' }, { key: 'Loan ID', label: 'Loan' }, { key: 'Principal Paid USD', label: 'Principal' },
+         { key: 'Interest Paid USD', label: 'Interest' }, { key: 'Penalty Paid USD', label: 'Penalty' }],
+        r => '<button class="btn small" onclick="approve(\'Repayment\',\'' + r['Transaction ID'] + '\')">Approve</button>');
+
+      renderTable(document.getElementById('tblPendOther'), p.other,
+        [{ key: 'Transaction ID', label: 'ID' }, { key: 'Category', label: 'Category' }, { key: 'Signed Amount USD', label: 'Amount' }],
+        r => '<button class="btn small" onclick="approve(\'Other\',\'' + r['Transaction ID'] + '\')">Approve</button>');
+    }).catch(e => flash('Approvals load failed: ' + e.message, false));
+
+    run('getUnpostedApproved').then(u => {
+      const rows = [].concat(
+        u.savings.map(r => ({ type: 'Savings', id: r['Transaction ID'], amount: r['Signed Amount USD'] })),
+        u.loans.map(r => ({ type: 'Loan', id: r['Loan ID'], amount: r['Principal USD'] })),
+        u.repayments.map(r => ({ type: 'Repayment', id: r['Transaction ID'], amount: r['Total Paid USD'] })),
+        u.other.map(r => ({ type: 'Other', id: r['Transaction ID'], amount: r['Signed Amount USD'] }))
+      );
+      renderTable(document.getElementById('tblUnposted'), rows,
+        [{ key: 'type', label: 'Type' }, { key: 'id', label: 'ID' }, { key: 'amount', label: 'Amount USD' }]);
+    });
+  }
+
+  const APPROVE_FN = { Saving: 'approveSaving', Loan: 'approveLoan', Repayment: 'approveRepayment', Other: 'approveOtherTransaction' };
+  function approve(kind, id) {
+    run(APPROVE_FN[kind], id, '').then(() => { flash(kind + ' ' + id + ' approved.', true); loadApprovals(); })
+      .catch(e => flash('Approve failed: ' + e.message, false));
+  }
+  function postAllNow() {
+    run('postAll').then(r => {
+      flash('Posted — Savings ' + r.savings + ', Loans ' + r.loans + ', Repayments ' + r.repayments + ', Other ' + r.other, true);
+      loadApprovals(); loadDashboard();
+    }).catch(e => flash('Posting failed: ' + e.message, false));
+  }
+
+  // ---------- MEETINGS ----------
+  function loadMeetings() {
+    run('listMeetings').then(rows => {
+      renderTable(document.getElementById('tblMeetings'), rows,
+        [{ key: 'Meeting ID', label: 'ID' }, { key: 'Meeting Date', label: 'Date' }, { key: 'Location', label: 'Location' },
+         { key: 'Status', label: 'Status' }, { key: 'Expected Cash Movement USD', label: 'Expected' },
+         { key: 'Actual Cash Count USD', label: 'Actual' }, { key: 'Cash Variance USD', label: 'Variance' }]);
+    }).catch(e => flash('Meetings load failed: ' + e.message, false));
+  }
+  function submitMeeting(ev) {
+    ev.preventDefault();
+    run('openMeeting', formToObject(ev.target)).then(id => { flash('Meeting ' + id + ' opened.', true); ev.target.reset(); loadMeetings(); })
+      .catch(e => flash('Failed: ' + e.message, false));
+    return false;
+  }
+  function recomputeOnly() {
+    const id = document.querySelector('#view-meetings form:nth-of-type(2) [name=meetingId]').value;
+    if (!id) return flash('Enter a Meeting ID first.', false);
+    run('recomputeMeetingTotals', id).then(exp => flash('Expected cash movement recomputed: $' + exp, true))
+      .catch(e => flash('Failed: ' + e.message, false));
+  }
+  function submitCloseMeeting(ev) {
+    ev.preventDefault();
+    const f = formToObject(ev.target);
+    run('closeMeeting', f.meetingId, Number(f.actualCashCount || 0), Number(f.membersPresent || 0), Number(f.membersAbsent || 0), f.notes || '')
+      .then(res => {
+        document.getElementById('meetingCloseResult').innerHTML =
+          '<div class="msg ' + (res.variance === 0 ? 'ok' : 'err') + '">Expected $' + res.expected +
+          ' vs Actual $' + res.actual + ' — Variance $' + res.variance + '</div>';
+        loadMeetings();
+      }).catch(e => flash('Failed: ' + e.message, false));
+    return false;
+  }
+
+  // ---------- MEMBERS ----------
+  function loadMembers() {
+    run('listMembers', false).then(rows => {
+      renderTable(document.getElementById('tblMembers'), rows,
+        [{ key: 'Member ID', label: 'ID' }, { key: 'Name English', label: 'Name' }, { key: 'Group Role', label: 'Role' },
+         { key: 'Status', label: 'Status' }, { key: 'Saving Target USD', label: 'Target' }]);
+    }).catch(e => flash('Members load failed: ' + e.message, false));
+  }
+  function submitMember(ev) {
+    ev.preventDefault();
+    run('addMember', formToObject(ev.target)).then(id => { flash('Member ' + id + ' added.', true); ev.target.reset(); loadMembers(); })
+      .catch(e => flash('Failed: ' + e.message, false));
+    return false;
+  }
+
+  // ---------- SAVINGS ----------
+  function loadSavings() {
+    run('listSavings', null).then(rows => {
+      renderTable(document.getElementById('tblSavings'), rows.slice(-50).reverse(),
+        [{ key: 'Transaction ID', label: 'ID' }, { key: 'Meeting ID', label: 'Meeting' }, { key: 'Member Name', label: 'Member' },
+         { key: 'Signed Amount USD', label: 'Amount' }, { key: 'Approval Status', label: 'Approval' }, { key: 'Posted?', label: 'Posted' }]);
+    }).catch(e => flash('Savings load failed: ' + e.message, false));
+  }
+  function submitSaving(ev) {
+    ev.preventDefault();
+    run('addSaving', formToObject(ev.target)).then(id => { flash('Saving ' + id + ' recorded (Pending).', true); ev.target.reset(); loadSavings(); })
+      .catch(e => flash('Failed: ' + e.message, false));
+    return false;
+  }
+
+  // ---------- LOANS ----------
+  function loadLoans() {
+    run('listLoans', null).then(rows => {
+      renderTable(document.getElementById('tblLoans'), rows,
+        [{ key: 'Loan ID', label: 'ID' }, { key: 'Member Name', label: 'Member' }, { key: 'Principal USD', label: 'Principal' },
+         { key: 'Outstanding Principal USD', label: 'Outstanding' }, { key: 'Approval Status', label: 'Approval' },
+         { key: 'Loan Status', label: 'Status' }],
+        r => r['Approval Status'] === 'Pending'
+          ? '<button class="btn small" onclick="approve(\'Loan\',\'' + r['Loan ID'] + '\')">Approve</button>' : '');
+    }).catch(e => flash('Loans load failed: ' + e.message, false));
+  }
+  function submitLoan(ev) {
+    ev.preventDefault();
+    run('addLoan', formToObject(ev.target)).then(id => { flash('Loan ' + id + ' submitted (Pending).', true); ev.target.reset(); loadLoans(); })
+      .catch(e => flash('Failed: ' + e.message, false));
+    return false;
+  }
+  function submitGenSchedule(ev) {
+    ev.preventDefault();
+    const loanId = ev.target.loanId.value;
+    run('generateLoanSchedule', loanId).then(n => {
+      flash(n + ' installments generated for ' + loanId, true);
+      run('getLoanSchedule', loanId).then(rows => renderTable(document.getElementById('tblSchedule'), rows,
+        [{ key: 'Installment No.', label: '#' }, { key: 'Due Date', label: 'Due' }, { key: 'Scheduled Principal USD', label: 'Principal' },
+         { key: 'Scheduled Interest USD', label: 'Interest' }, { key: 'Scheduled Total USD', label: 'Total' },
+         { key: 'Closing Principal USD', label: 'Closing Bal' }]));
+    }).catch(e => flash('Failed: ' + e.message, false));
+    return false;
+  }
+
+  // ---------- REPAYMENTS ----------
+  function loadRepayments() {
+    run('listRepayments', null).then(rows => {
+      renderTable(document.getElementById('tblRepayments'), rows.slice(-50).reverse(),
+        [{ key: 'Transaction ID', label: 'ID' }, { key: 'Loan ID', label: 'Loan' }, { key: 'Principal Paid USD', label: 'Principal' },
+         { key: 'Interest Paid USD', label: 'Interest' }, { key: 'Penalty Paid USD', label: 'Penalty' },
+         { key: 'Approval Status', label: 'Approval' }, { key: 'Posted?', label: 'Posted' }]);
+    }).catch(e => flash('Repayments load failed: ' + e.message, false));
+  }
+  function submitRepayment(ev) {
+    ev.preventDefault();
+    run('addRepayment', formToObject(ev.target)).then(id => { flash('Repayment ' + id + ' recorded (Pending).', true); ev.target.reset(); loadRepayments(); })
+      .catch(e => flash('Failed: ' + e.message, false));
+    return false;
+  }
+
+  // ---------- HISTORICAL DATA ----------
+  const historyState = { kind: 'cash', payload: null };
+
+  function loadHistory(kind) {
+    historyState.kind = kind === 'petty' ? 'petty' : 'cash';
+    document.getElementById('historyCashBtn').className =
+      'btn small ' + (historyState.kind === 'cash' ? 'active' : 'secondary');
+    document.getElementById('historyPettyBtn').className =
+      'btn small ' + (historyState.kind === 'petty' ? 'active' : 'secondary');
+    document.getElementById('historyStats').innerHTML =
+      '<div class="card"><div class="empty">Loading historical totals…</div></div>';
+    document.getElementById('tblHistory').innerHTML =
+      '<tr><td class="empty">Loading verified archive…</td></tr>';
+
+    run('getHistoricalData', historyState.kind).then(data => {
+      historyState.payload = data;
+      const category = document.getElementById('historyCategory');
+      category.innerHTML = '<option value="">All categories</option>' +
+        data.categories.map(c => '<option value="' + c + '">' + c + '</option>').join('');
+      document.getElementById('historySearch').value = '';
+      document.getElementById('historyNote').textContent =
+        data.label + ' · ' + data.sourcePeriod + ' · ' + data.note;
+      renderHistoryRows();
+    }).catch(e => flash('Historical data load failed: ' + e.message, false));
+  }
+
+  function renderHistoryRows() {
+    const data = historyState.payload;
+    if (!data) return;
+    const query = document.getElementById('historySearch').value.trim().toLowerCase();
+    const category = document.getElementById('historyCategory').value;
+
+    const filtered = data.rows.filter(r => {
+      const matchesCategory = !category || r.category === category;
+      const haystack = [r.date, r.category, r.description, r.chargedTo, r.receivedBy, r.approvedBy]
+        .join(' ').toLowerCase();
+      return matchesCategory && (!query || haystack.includes(query));
+    }).slice().reverse();
+
+    document.getElementById('historyStats').innerHTML =
+      historyMetricCard('Transactions', data.summary.count.toLocaleString(), 'Verified rows') +
+      historyMetricCard('Cash in', moneyHistory(data.summary.totalIn), data.label) +
+      historyMetricCard('Cash out', moneyHistory(data.summary.totalOut), data.label) +
+      historyMetricCard('Ending balance', moneyHistory(data.summary.balance), data.sourcePeriod);
+
+    document.getElementById('historyCount').textContent =
+      filtered.length.toLocaleString() + ' of ' + data.summary.count.toLocaleString() + ' records';
+
+    const columns = [
+      { key: 'date', label: 'Date' },
+      { key: 'category', label: 'Category' },
+      { key: 'description', label: 'Description' },
+      { key: 'deposited', label: 'Cash In USD' },
+      { key: 'withdrawn', label: 'Cash Out USD' }
+    ];
+    if (data.kind === 'cash') columns.push({ key: 'balance', label: 'Running Balance' });
+    columns.push(
+      { key: 'chargedTo', label: 'Charged To' },
+      { key: 'receivedBy', label: 'Received By' },
+      { key: 'approvedBy', label: 'Approved By' }
+    );
+    renderTable(document.getElementById('tblHistory'), filtered, columns);
+  }
+
+  function historyMetricCard(label, value, helper) {
+    return '<div class="card kpi history-kpi"><div class="label">' + label +
+      '</div><div class="value">' + value +
+      '</div><div class="history-helper">' + helper + '</div></div>';
+  }
+
+  function moneyHistory(value) {
+    return String.fromCharCode(36) + Number(value || 0).toLocaleString(undefined, {
+      minimumFractionDigits: 2, maximumFractionDigits: 2
+    });
+  }
+  // ---------- REPORTS ----------
+  function loadReportsDefaults() {
+    run('getCashbook', 50).then(rows => {
+      renderTable(document.getElementById('tblCashbook'), rows.slice(-50).reverse(),
+        [{ key: 'Date', label: 'Date' }, { key: 'Source', label: 'Source' }, { key: 'Description', label: 'Description' },
+         { key: 'Cash In USD', label: 'In' }, { key: 'Cash Out USD', label: 'Out' }, { key: 'Running Balance USD', label: 'Balance' }]);
+    });
+    run('getPAROverview').then(rows => {
+      renderTable(document.getElementById('tblPAR'), rows,
+        [{ key: 'Loan ID', label: 'Loan' }, { key: 'Member Name', label: 'Member' }, { key: 'Outstanding Principal USD', label: 'Outstanding' },
+         { key: 'Days Past Due', label: 'Days Late' }, { key: 'PAR Status', label: 'PAR Status' }]);
+    });
+  }
+  function loadStatement(ev) {
+    ev.preventDefault();
+    const memberId = ev.target.memberId.value;
+    run('getMemberStatement', memberId).then(s => {
+      renderTable(document.getElementById('tblStatement'), s.ledger,
+        [{ key: 'Date', label: 'Date' }, { key: 'Source', label: 'Source' }, { key: 'Description', label: 'Description' },
+         { key: 'Savings In USD', label: 'Sav In' }, { key: 'Savings Out USD', label: 'Sav Out' },
+         { key: 'Loan Disbursed USD', label: 'Loan Out' }, { key: 'Principal Repaid USD', label: 'Principal Paid' },
+         { key: 'Savings Balance USD', label: 'Savings Bal' }, { key: 'Loan Balance USD', label: 'Loan Bal' }]);
+    }).catch(e => flash('Statement load failed: ' + e.message, false));
+    return false;
+  }
+
+  // ---------- boot ----------
+  document.addEventListener('DOMContentLoaded', () => {
+    document.getElementById('headerUser').textContent = '';
+    loadDashboard();
+  });
+</script>
